@@ -24,12 +24,13 @@ sram = (
     cuda.get_current_device().MAX_SHARED_MEMORY_PER_BLOCK
 )  # this is in bytes, e.g. 0xc000 = 49152 bytes
 B_r = B_c = math.ceil(
-    sram / (d_head * d_head_bytes)
+    sram / (3 * d_head_bytes)
 )  # because we need to store Q,K,V and O in SRAM <- the number of threads we can run in parallel given the SRAM size, this is also the number of threads per block
+# the original algo also puts o in SRAM, but we can't do that here, we write directly in global memory (potentially this can lead to iefficiency)
 
 
 @cuda.jit
-def flash_attn_kernel(q, k, v, out, T_r, T_c):
+def flash_attn_forward_kernel(q, k, v, out, T_r, T_c):
     # we run one block per head
     block_b = cuda.blockIdx.x  # coordinate of the batch index
     block_h = cuda.blockIdx.y  # coordinate of the head index
@@ -98,13 +99,13 @@ class FlashAttn(Function):
         block_dim = B_c
         # out should be b, h, s, d, where d is
         out = torch.zeros(b, h, s, d_head).to(device)
-        q_numba = numba.cuda.as_cuda_array(q.detach().float())
-        k_numba = numba.cuda.as_cuda_array(k.detach().float())
-        v_numba = numba.cuda.as_cuda_array(v.detach().float())
+        q_numba = numba.cuda.as_cuda_array(q.detach())
+        k_numba = numba.cuda.as_cuda_array(k.detach())
+        v_numba = numba.cuda.as_cuda_array(v.detach())
         out = numba.cuda.as_cuda_array(out)
 
         T_c, T_r = math.ceil(s / B_c), math.ceil(s / B_r)
-        flash_attn_kernel[grid_dim, block_dim](q_numba, k_numba, v_numba, out, T_r, T_c)
+        flash_attn_forward_kernel[grid_dim, block_dim](q_numba, k_numba, v_numba, out, T_r, T_c)
         cuda.synchronize()
         out_numba = out.copy_to_host()
         return torch.tensor(out_numba).to(device)
