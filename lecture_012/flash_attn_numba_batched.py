@@ -30,7 +30,7 @@ B_r = B_c = math.ceil(
 
 
 @cuda.jit
-def flash_attn_forward_kernel(q, k, v, out, T_r, T_c):
+def flash_attn_forward_kernel(q, k, v, out, T_r, T_c, tau):
     # we run one block per head
     block_b = cuda.blockIdx.x  # coordinate of the batch index
     block_h = cuda.blockIdx.y  # coordinate of the head index
@@ -66,7 +66,7 @@ def flash_attn_forward_kernel(q, k, v, out, T_r, T_c):
                     curr_m = m
                     Sij = 0.0
                     for k_dim in range(Q_shared.shape[1]):
-                        Sij += Q_shared[thread_i, k_dim] * K_shared[b_c, k_dim]
+                        Sij += tau * (Q_shared[thread_i, k_dim] * K_shared[b_c, k_dim])
 
                     new_m = max(curr_m, Sij)
                     exp_Sij = math.exp(Sij - new_m)
@@ -86,10 +86,14 @@ def flash_attn_forward_kernel(q, k, v, out, T_r, T_c):
                     m = new_m
             cuda.syncthreads()  # this sync is needed as threads can go ovewrite the same l and m values, also K_shared and V_shared
 
+@cuda.jit
+def flash_attn_backward_kernel(grad_q, grad_k, grad_v, grad_out, T_r, T_c):
+    pass
 
 class FlashAttn(Function):
     @staticmethod
     def forward(ctx, q, k, v):
+        
         b, h, s, d_head_local = q.size()
         assert d_head_local == d_head
         # q is b, h, s, d
@@ -105,13 +109,15 @@ class FlashAttn(Function):
         out = numba.cuda.as_cuda_array(out)
 
         T_c, T_r = math.ceil(s / B_c), math.ceil(s / B_r)
-        flash_attn_forward_kernel[grid_dim, block_dim](q_numba, k_numba, v_numba, out, T_r, T_c)
+        tau = 1/math.sqrt(q.size(-1)) # scaling constant
+        flash_attn_forward_kernel[grid_dim, block_dim](q_numba, k_numba, v_numba, out, T_r, T_c, tau)
         cuda.synchronize()
         out_numba = out.copy_to_host()
         return torch.tensor(out_numba).to(device)
 
     @staticmethod
     def backward(ctx, grad_output):
+        # backard requires S and P -- logits and softmaxed attention
         raise NotImplementedError("Backward pass not implemented for FlashAttn")
 
 
@@ -155,6 +161,9 @@ class Attn(Function):
 def attention(q, k, v, mask=None, dropout=None):
     # q,k,v : (b, h, s, d)
     attn_logits = torch.matmul(q, k.transpose(-2, -1))
+    attn_logits = attn_logits / torch.sqrt(
+        torch.tensor(q.size(-1), dtype=torch.float32)
+    )
     attn = torch.nn.functional.softmax(attn_logits, dim=-1)  # (b, h, s, s)
     return torch.matmul(attn, v), attn, attn_logits
 
