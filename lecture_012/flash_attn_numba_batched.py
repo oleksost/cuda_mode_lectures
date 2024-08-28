@@ -16,11 +16,12 @@ s = 1024 # seq length
 n_heads = 8
 d_model = 128 # hidden dim
 d_head = d_model // n_heads # this is in numbers, each number is float32, so 4 bytes
+d_head_bytes = d_head * 4
 assert d_model % n_heads == 0
 
 b = 32 # batch size
 sram = cuda.get_current_device().MAX_SHARED_MEMORY_PER_BLOCK # this is in bytes, e.g. 0xc000 = 49152 bytes
-B_r = B_c = math.ceil(sram / (d_head * 4 * 4)) # because we need to store Q,K,V and O in SRAM <- the number of threads we can run in parallel given the SRAM size, this is also the number of threads per block
+B_r = B_c = math.ceil(sram / (d_head * d_head_bytes)) # because we need to store Q,K,V and O in SRAM <- the number of threads we can run in parallel given the SRAM size, this is also the number of threads per block
 
 @cuda.jit
 def flash_attn_kernel(q, k, v, out, T_r, T_c):
