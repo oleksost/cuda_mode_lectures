@@ -12,40 +12,43 @@ torch.autograd.set_detect_anomaly(True)
 # os.environ["NUMBA_ENABLE_CUDASIM"] = "1"
 
 
-s = 1024 # seq length
+s = 1024  # seq length
 n_heads = 8
-d_model = 128 # hidden dim
-d_head = d_model // n_heads # this is in numbers, each number is float32, so 4 bytes
+d_model = 128  # hidden dim
+d_head = d_model // n_heads  # this is in numbers, each number is float32, so 4 bytes
 d_head_bytes = d_head * 4
 assert d_model % n_heads == 0
 
-b = 32 # batch size
-sram = cuda.get_current_device().MAX_SHARED_MEMORY_PER_BLOCK # this is in bytes, e.g. 0xc000 = 49152 bytes
-B_r = B_c = math.ceil(sram / (d_head * d_head_bytes)) # because we need to store Q,K,V and O in SRAM <- the number of threads we can run in parallel given the SRAM size, this is also the number of threads per block
+b = 32  # batch size
+sram = (
+    cuda.get_current_device().MAX_SHARED_MEMORY_PER_BLOCK
+)  # this is in bytes, e.g. 0xc000 = 49152 bytes
+B_r = B_c = math.ceil(
+    sram / (d_head * d_head_bytes)
+)  # because we need to store Q,K,V and O in SRAM <- the number of threads we can run in parallel given the SRAM size, this is also the number of threads per block
+
 
 @cuda.jit
 def flash_attn_kernel(q, k, v, out, T_r, T_c):
     # we run one block per head
-    block_b = cuda.blockIdx.x # coordinate of the batch index
-    block_h = cuda.blockIdx.y # coordinate of the head index
+    block_b = cuda.blockIdx.x  # coordinate of the batch index
+    block_h = cuda.blockIdx.y  # coordinate of the head index
     # then we run B_r threads per block taking care of the s and d dimention
     thread_i = cuda.threadIdx.x
-    
-    
+
     # k,v,q are shape (b,h,s,d)
     K_shared = cuda.shared.array(shape=(B_c, d_head), dtype=numba.float32)
     V_shared = cuda.shared.array(shape=(B_c, d_head), dtype=numba.float32)
     Q_shared = cuda.shared.array(shape=(B_r, d_head), dtype=numba.float32)
-    
-    
 
+    # here we run in parallel over the s of K and O
     for j in range(T_r):
         r_idx = j * B_r + thread_i
         if r_idx < s:
             for c in range(Q_shared.shape[1]):
                 Q_shared[thread_i, c] = q[block_b, block_h, r_idx, c]
         cuda.syncthreads()
-        l, m = 0.0, 0.0 
+        l, m = 0.0, 0.0
         for i in range(T_c):
             c_idx = i * B_c + thread_i
             if c_idx < s:
@@ -73,40 +76,43 @@ def flash_attn_kernel(q, k, v, out, T_r, T_c):
                     for v_dim in range(d_head):
                         # this writes each element to the global memory
                         out[block_b, block_h, r_idx, v_dim] = (
-                            out[block_b, block_h, r_idx, v_dim] * (curr_l * exp_max / new_l)
+                            out[block_b, block_h, r_idx, v_dim]
+                            * (curr_l * exp_max / new_l)
                             + (exp_Sij / new_l) * V_shared[b_c, v_dim]
                         )
 
                     l = new_l
                     m = new_m
-            cuda.syncthreads()
+            cuda.syncthreads()  # this sync is needed as threads can go ovewrite the same l and m values, also K_shared and V_shared
+
 
 class FlashAttn(Function):
     @staticmethod
     def forward(ctx, q, k, v):
-        b,h,s,d_head_local = q.size()
+        b, h, s, d_head_local = q.size()
         assert d_head_local == d_head
         # q is b, h, s, d
         # we parallelize by having a block of threads per head, and we have b x h heads
         grid_dim = (b, h)
         assert B_r == B_c
         block_dim = B_c
-        # out should be b, h, s, d, where d is 
+        # out should be b, h, s, d, where d is
         out = torch.zeros(b, h, s, d_head).to(device)
         q_numba = numba.cuda.as_cuda_array(q.detach().float())
         k_numba = numba.cuda.as_cuda_array(k.detach().float())
         v_numba = numba.cuda.as_cuda_array(v.detach().float())
         out = numba.cuda.as_cuda_array(out)
-        
-        T_c,T_r = math.ceil(s/B_c), math.ceil(s/B_r)        
+
+        T_c, T_r = math.ceil(s / B_c), math.ceil(s / B_r)
         flash_attn_kernel[grid_dim, block_dim](q_numba, k_numba, v_numba, out, T_r, T_c)
         cuda.synchronize()
         out_numba = out.copy_to_host()
         return torch.tensor(out_numba).to(device)
-    
+
     @staticmethod
     def backward(ctx, grad_output):
         raise NotImplementedError("Backward pass not implemented for FlashAttn")
+
 
 class Attn(Function):
     @staticmethod
@@ -120,7 +126,7 @@ class Attn(Function):
             attn,
         )
         return out
-    
+
     @staticmethod
     def backward(ctx, grad_output):
         print("backward")
@@ -182,7 +188,8 @@ def main():
     attention = Attention(d_model, n_heads).to(device)
     out, out_attn_fa = attention(x, use_flash=True)
     _, out_attn = attention(x, use_flash=False)
-    print(torch.allclose(out_attn, out_attn_fa, atol=1e-2))  
+    print(torch.allclose(out_attn, out_attn_fa, atol=1e-2))
+
 
 if __name__ == "__main__":
     main()
