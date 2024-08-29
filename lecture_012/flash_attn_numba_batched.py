@@ -144,10 +144,10 @@ def flash_attn_backward_kernel(
             cuda.syncthreads()
             if c_idx < s:
                 # Re-computing attention scores Sij = Qi * Kj^T
-                for b_r in range(
+                for rr in range(
                     i * B_r_bk, min((i + 1) * B_r_bk, s)
                 ):  # this is from 0 to B_r basically
-                    b_r = b_r - (i * B_r_bk)
+                    b_r = rr - (i * B_r_bk)
                     Sij = 0.0
                     for k_dim in range(Q_shared.shape[1]):
                         Sij += tau * (Q_shared[b_r, k_dim] * K_shared[thread_i, k_dim])
@@ -175,8 +175,8 @@ def flash_attn_backward_kernel(
                         # race condition?
                         # is this a problem? Cause all threads write to the same grad_q
                         # dQ_shared[i * B_r_bk + b_r, q_dim] += (tau * dSij * K_shared[thread_i, q_dim])  
-                        # cuda.atomic.add(grad_q[block_b, block_h, i * B_r_bk + b_r, q_dim] += (tau * dSij * K_shared[thread_i, q_dim])
-                        cuda.atomic.add(grad_q, (block_b, block_h, i * B_r_bk + b_r, q_dim), tau * dSij * K_shared[thread_i, q_dim]) # this is slow?
+                        # grad_q[block_b, block_h, i * B_r_bk + b_r, q_dim] += (tau * dSij * K_shared[thread_i, q_dim])
+                        cuda.atomic.add(grad_q, (block_b, block_h, (i * B_r_bk) + b_r, q_dim), tau * dSij * K_shared[thread_i, q_dim]) # this is slow?
 
                     # update dK
                     for k_dim in range(dK_shared.shape[1]):
@@ -313,6 +313,9 @@ class Attn(Function):
 
 def attention(q, k, v, mask=None, dropout=None):
     # q,k,v : (b, h, s, d)
+    # set seed
+    torch.manual_seed(0)    
+    
     attn_logits = torch.matmul(q, k.transpose(-2, -1))
     attn_logits = attn_logits / torch.sqrt(
         torch.tensor(q.size(-1), dtype=torch.float32)
