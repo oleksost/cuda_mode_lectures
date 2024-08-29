@@ -134,7 +134,7 @@ def flash_attn_backward_kernel(
             r_idx = i * B_r_bk + thread_i
             if r_idx < s:
                 for c in range(dQ_shared.shape[1]):
-                    dQ_shared[thread_i, c] = grad_q[block_b, block_h, r_idx, c]
+                    dQ_shared[thread_i, c] = 0.0 #grad_q[block_b, block_h, r_idx, c]
                     Q_shared[thread_i, c] = q[block_b, block_h, r_idx, c]
                     dO_shared[thread_i, c] = grad_out[block_b, block_h, r_idx, c]
                     O_shared[thread_i, c] = o[block_b, block_h, r_idx, c]
@@ -142,12 +142,12 @@ def flash_attn_backward_kernel(
                 l_shared[thread_i] = l_hbm[block_b, block_h, r_idx]
                 m_shared[thread_i] = m_hbm[block_b, block_h, r_idx]
             cuda.syncthreads()
-            if r_idx < s:
+            if c_idx < s:
                 # Re-computing attention scores Sij = Qi * Kj^T
                 for b_r in range(
                     i * B_r_bk, min((i + 1) * B_r_bk, s)
                 ):  # this is from 0 to B_r basically
-                    b_r = b_r - i * B_r_bk
+                    b_r = b_r - (i * B_r_bk)
                     Sij = 0.0
                     for k_dim in range(Q_shared.shape[1]):
                         Sij += tau * (Q_shared[b_r, k_dim] * K_shared[thread_i, k_dim])
@@ -172,15 +172,18 @@ def flash_attn_backward_kernel(
                     dSij = Pij * (dPij - Di)
 
                     for q_dim in range(dQ_shared.shape[1]):
-                        grad_q[block_b, block_h, i * B_r_bk + b_r, q_dim] = grad_q[
-                            block_b, block_h, i * B_r_bk + b_r, q_dim
-                        ] + (tau * dSij * K_shared[thread_i, q_dim])
+                        # race condition?
+                        # is this a problem? Cause all threads write to the same grad_q
+                        # dQ_shared[i * B_r_bk + b_r, q_dim] += (tau * dSij * K_shared[thread_i, q_dim])  
+                        # cuda.atomic.add(grad_q[block_b, block_h, i * B_r_bk + b_r, q_dim] += (tau * dSij * K_shared[thread_i, q_dim])
+                        cuda.atomic.add(grad_q, (block_b, block_h, i * B_r_bk + b_r, q_dim), tau * dSij * K_shared[thread_i, q_dim]) # this is slow?
 
                     # update dK
                     for k_dim in range(dK_shared.shape[1]):
-                        dK_shared[thread_i, k_dim] += tau * dSij * Q_shared[b_r, k_dim]
+                        dK_shared[thread_i, k_dim] += (tau * dSij * Q_shared[b_r, k_dim])
 
             cuda.syncthreads()
+            
         if c_idx < s:
             for v_dim in range(dV_shared.shape[1]):
                 grad_v[block_b, block_h, c_idx, v_dim] = dV_shared[thread_i, v_dim]
