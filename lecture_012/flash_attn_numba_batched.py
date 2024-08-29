@@ -172,7 +172,7 @@ def flash_attn_backward_kernel(
                     dSij = Pij * (dPij - Di)
 
                     for q_dim in range(dQ_shared.shape[1]):
-                        # race condition?
+                        # race condition? <- addressed with atomic add
                         # is this a problem? Cause all threads write to the same grad_q
                         # dQ_shared[i * B_r_bk + b_r, q_dim] += (tau * dSij * K_shared[thread_i, q_dim])  
                         # grad_q[block_b, block_h, i * B_r_bk + b_r, q_dim] += (tau * dSij * K_shared[thread_i, q_dim])
@@ -267,8 +267,7 @@ class FlashAttn(Function):
         dQ = torch.tensor(dQ).to(device)
         dK = torch.tensor(dK).to(device)
         dV = torch.tensor(dV).to(device)
-        # import pdb
-        # pdb.set_trace()
+        # K and Q gads are still too different from the ones in standard attention
         print("Attention FA grad sum:", dQ.sum(), dK.sum(), dV.sum())
         return dQ, dK, dV
 
