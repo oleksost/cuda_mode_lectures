@@ -28,7 +28,10 @@ B_r = B_c = math.ceil(
 )  # because we need to store Q,K,V and O in SRAM <- the number of threads we can run in parallel given the SRAM size, this is also the number of threads per block
 # the original algo also puts o in SRAM, but we can't do that here, we write directly in global memory (potentially this can lead to iefficiency)
 
-B_r_bk = B_c_bk = math.ceil(sram / (10 * d_head_bytes))  # for backward pass, where we need to load much more stuff in SRAM.
+B_r_bk = B_c_bk = math.ceil(
+    sram / (10 * d_head_bytes)
+)  # for backward pass, where we need to load much more stuff in SRAM.
+
 
 @cuda.jit
 def flash_attn_forward_kernel(q, k, v, out, T_r, T_c, tau, l_hbm, m_hbm):
@@ -87,8 +90,9 @@ def flash_attn_forward_kernel(q, k, v, out, T_r, T_c, tau, l_hbm, m_hbm):
                     m = new_m
             cuda.syncthreads()  # this sync is needed as threads can go ovewrite the same l and m values, also K_shared and V_shared
 
-        l_hbm[block_b, block_h, r_idx] = l
-        m_hbm[block_b, block_h, r_idx] = m
+        if r_idx < s:
+            l_hbm[block_b, block_h, r_idx] = l
+            m_hbm[block_b, block_h, r_idx] = m
 
 
 @cuda.jit
@@ -134,7 +138,7 @@ def flash_attn_backward_kernel(
                     Q_shared[thread_i, c] = q[block_b, block_h, r_idx, c]
                     dO_shared[thread_i, c] = grad_out[block_b, block_h, r_idx, c]
                     O_shared[thread_i, c] = o[block_b, block_h, r_idx, c]
-                    
+
                 l_shared[thread_i] = l_hbm[block_b, block_h, r_idx]
                 m_shared[thread_i] = m_hbm[block_b, block_h, r_idx]
             cuda.syncthreads()
@@ -145,43 +149,43 @@ def flash_attn_backward_kernel(
                 ):  # this is from 0 to B_r basically
                     b_r = b_r - i * B_r_bk
                     Sij = 0.0
-                    for k_dim in range(dQ_shared.shape[1]):
-                        Sij += tau * (
-                            dQ_shared[b_r, k_dim] * dK_shared[thread_i, k_dim]
-                        )
+                    for k_dim in range(Q_shared.shape[1]):
+                        Sij += tau * (Q_shared[b_r, k_dim] * K_shared[thread_i, k_dim])
                     # now we can actually instantiate the attention scores
-                    Pij = 1 / l_shared[b_r] * math.exp(Sij - m_shared[b_r])
-                    
+                    Pij = (math.exp(Sij - m_shared[b_r])) / l_shared[b_r]
+
                     # update dV
                     for v_dim in range(dV_shared.shape[1]):
                         # its just the sum of the block gradients
                         dV_shared[thread_i, v_dim] += Pij * dO_shared[b_r, v_dim]
-                        
+
                     # dP
                     dPij = 0.0
                     for o_dim in range(dO_shared.shape[1]):
                         dPij += dO_shared[b_r, o_dim] * V_shared[thread_i, o_dim]
-                        
-                        
-                    # compute Di sum 
+
+                    # compute Di sum
                     Di = 0.0
                     for o_dim in range(dO_shared.shape[1]):
                         Di += dO_shared[b_r, o_dim] * O_shared[b_r, o_dim]
-                    
+
                     dSij = Pij * (dPij - Di)
-                    
+
                     for q_dim in range(dQ_shared.shape[1]):
-                        grad_q[block_b, block_h, r_idx, q_dim] += tau * dSij * K_shared[thread_i, q_dim]
-                        
+                        grad_q[block_b, block_h, i * B_r_bk + b_r, q_dim] = grad_q[
+                            block_b, block_h, i * B_r_bk + b_r, q_dim
+                        ] + (tau * dSij * K_shared[thread_i, q_dim])
+
                     # update dK
                     for k_dim in range(dK_shared.shape[1]):
-                        dK_shared[thread_i, k_dim] += tau * dSij * dQ_shared[b_r, k_dim]
-                
+                        dK_shared[thread_i, k_dim] += tau * dSij * Q_shared[b_r, k_dim]
+
             cuda.syncthreads()
         if c_idx < s:
             for v_dim in range(dV_shared.shape[1]):
                 grad_v[block_b, block_h, c_idx, v_dim] = dV_shared[thread_i, v_dim]
                 grad_k[block_b, block_h, c_idx, v_dim] = dK_shared[thread_i, v_dim]
+        cuda.syncthreads()
 
 
 class FlashAttn(Function):
@@ -237,10 +241,10 @@ class FlashAttn(Function):
         dV_numba = numba.cuda.as_cuda_array(dV)
         T_c, T_r = math.ceil(s / B_c_bk), math.ceil(s / B_r_bk)
 
-        tau = 1 / math.sqrt(d)
         grid_dim = (b, h)
         block_dim = B_c_bk
         l, m, q, k, v, o = ctx.saved_tensors
+        tau = 1 / math.sqrt(q.size(-1))  # scaling constant
         l = numba.cuda.as_cuda_array(l.detach())
         m = numba.cuda.as_cuda_array(m.detach())
         q = numba.cuda.as_cuda_array(q.detach())
@@ -248,7 +252,6 @@ class FlashAttn(Function):
         v = numba.cuda.as_cuda_array(v.detach())
         o = numba.cuda.as_cuda_array(o.detach())
 
-        
         # right now this obviously uses too much SRAM, we need to optimize this
         flash_attn_backward_kernel[grid_dim, block_dim](
             dQ_numba, dK_numba, dV_numba, q, k, v, o, dO_numba, T_r, T_c, tau, l, m
@@ -257,7 +260,7 @@ class FlashAttn(Function):
         dQ = dQ_numba.copy_to_host()
         dK = dK_numba.copy_to_host()
         dV = dV_numba.copy_to_host()
-        
+
         dQ = torch.tensor(dQ).to(device)
         dK = torch.tensor(dK).to(device)
         dV = torch.tensor(dV).to(device)
@@ -282,7 +285,7 @@ class Attn(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        print("backward")
+        # print("backward")
         # Retrieve saved tensors
         q, k, v, attn = ctx.saved_tensors
 
@@ -311,7 +314,9 @@ def attention(q, k, v, mask=None, dropout=None):
     attn_logits = attn_logits / torch.sqrt(
         torch.tensor(q.size(-1), dtype=torch.float32)
     )
-    attn = torch.nn.functional.softmax(attn_logits, dim=-1)  # (b, h, s, s)
+    attn = torch.nn.functional.softmax(
+        attn_logits - torch.max(attn_logits, dim=-1)[0].unsqueeze(-1), dim=-1
+    )
     return torch.matmul(attn, v), attn, attn_logits
 
 
@@ -346,14 +351,12 @@ def main():
     o_fa, out_attn_fa = attention(x, use_flash=True)
     o_fa.sum().backward()
     attention.zero_grad()
-    
+
     o_attn, out_attn = attention(x, use_flash=False)
     o_attn.sum().backward()
-    
-    
-    print(torch.allclose(out_attn, out_attn_fa, atol=1e-2))
-    print(o_fa.sum(), o_attn.sum())
-    
+
+    print("Forward pass activations allighn:", torch.allclose(out_attn, out_attn_fa, atol=1e-2))
+    print("Forward outputs align:", torch.allclose(o_fa.sum(), o_attn.sum(), atol=1e-1))
 
 
 if __name__ == "__main__":
